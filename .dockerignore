@@ -1,0 +1,25 @@
+# Ignore unnecessary files when building Docker image
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.git/
+.gitignore
+*.md
+*.txt
+!requirements-airflow.txt
+venv/
+env/
+.venv/
+*.db
+*.duckdb
+.vscode/
+.idea/
+*.log
+

@@ -1,0 +1,252 @@
+# Removed version - it's obsolete in newer docker-compose versions
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  image: transactions-pipeline-airflow:custom
+  environment:
+    AIRFLOW__CORE__FERNET_KEY: 'FNJaCI6LhDBjL3fmJ5yTHXd6yAt-XunQK-u2XC77eog='
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'your-secret-key-here-change-in-production'
+
+    # ---- EXECUTOR ----
+    # Using LocalExecutor - simpler, runs tasks in scheduler process (no separate workers needed)
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+    # ---- AIRFLOW DB ----
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+
+    # ---- MINIO CONNECTION ----
+    # This creates the Airflow connection "minio_conn"
+    AIRFLOW_CONN_MINIO_CONN: >
+      aws://minio:minio123@/?host=http://minio:9000&region_name=us-east-1
+
+    # Disable Airflow example DAGs
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+
+    # Packages are pre-installed in custom Docker image
+    # _PIP_ADDITIONAL_REQUIREMENTS: 'pandas pyarrow duckdb boto3 s3fs confluent-kafka transformers torch sentencepiece protobuf'
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - .:/opt/airflow/workspace
+    - ./requirements-airflow.txt:/requirements-airflow.txt
+  depends_on:
+    - airflow-db
+    - minio-init
+    - kafka
+
+services:
+  # -----------------------------------------
+  # ZOOKEEPER
+  # -----------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - '2181:2181'
+
+  # -----------------------------------------
+  # KAFKA (dual listeners)
+  # -----------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    environment:
+      KAFKA_BROKER_ID: '1'
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:19092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT_INTERNAL'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1'
+
+    depends_on:
+      - zookeeper
+    ports:
+      - '9092:9092'
+      - '19092:19092'
+
+  # -----------------------------------------
+  # MINIO
+  # -----------------------------------------
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - minio_data:/data
+
+  # -----------------------------------------
+  # MINIO BUCKET INIT (creates datalake bucket)
+  # -----------------------------------------
+  minio-init:
+    <<: *airflow-common
+    entrypoint: >
+      bash -c "
+      pip install boto3 -q &&
+      python3 /opt/airflow/scripts/init_minio_bucket.py
+      "
+    depends_on:
+      minio:
+        condition: service_started
+    restart: 'on-failure'
+
+  # -----------------------------------------
+  # DATABASE FOR AIRFLOW
+  # -----------------------------------------
+  airflow-db:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U airflow']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------------------
+  # AIRFLOW INIT (run only once)
+  # -----------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: >
+      bash -c "
+      echo '⏳ Waiting for database to be ready...' &&
+      until airflow db check >/dev/null 2>&1; do echo 'Database not ready, waiting...'; sleep 2; done &&
+      echo '✅ Database is ready' &&
+      echo '🔄 Running database migration...' &&
+      airflow db migrate &&
+      echo '🔗 Creating default connections...' &&
+      airflow connections create-default-connections &&
+      echo '👤 Creating admin user...' &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com 2>&1 | grep -v 'already exists' || echo 'ℹ️  Admin user may already exist' &&
+      echo '✅ Airflow initialization complete'
+      "
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    restart: 'no'
+
+  # -----------------------------------------
+  # AIRFLOW SCHEDULER
+  # -----------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      - airflow-init
+
+  # -----------------------------------------
+  # AIRFLOW WEB UI
+  # -----------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - '8080:8080'
+    depends_on:
+      - airflow-init
+
+  # -----------------------------------------
+  # AIRFLOW TRIGGERER (required)
+  # -----------------------------------------
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      - airflow-init
+
+  # -----------------------------------------
+  # APACHE FLINK JOBMANAGER
+  # -----------------------------------------
+  flink-jobmanager:
+    image: flink:1.18-scala_2.12-java11
+    container_name: flink-jobmanager
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+    ports:
+      - '8081:8081'
+    volumes:
+      - ./scripts:/opt/flink/usrlib
+      - ./scripts/flink_jobs:/opt/flink/jobs
+    networks:
+      - default
+
+  # -----------------------------------------
+  # APACHE FLINK TASKMANAGER
+  # -----------------------------------------
+  flink-taskmanager:
+    image: flink:1.18-scala_2.12-java11
+    container_name: flink-taskmanager
+    command: taskmanager
+    depends_on:
+      - flink-jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+    volumes:
+      - ./scripts:/opt/flink/usrlib
+    networks:
+      - default
+
+  # -----------------------------------------
+  # AIRFLOW DAG TRIGGER (runs pipeline automatically)
+  # -----------------------------------------
+  airflow-trigger-dag:
+    <<: *airflow-common
+    entrypoint: >
+      bash -c "
+      echo '⏳ Waiting for Airflow webserver to be ready (this may take 5-10 minutes while packages install)...' &&
+      MAX_WAIT=600 &&
+      ELAPSED=0 &&
+      while [ $${ELAPSED} -lt $${MAX_WAIT} ]; do
+        if curl -s http://airflow-webserver:8080/health >/dev/null 2>&1; then
+          echo '✅ Airflow is ready!' &&
+          break
+        fi
+        ELAPSED=$$((ELAPSED + 10)) &&
+        MINUTES=$$((ELAPSED / 60)) &&
+        echo \"⏳ Still waiting... ($${MINUTES} minutes elapsed - packages are still installing)\" &&
+        sleep 10
+      done &&
+      if [ $${ELAPSED} -ge $${MAX_WAIT} ]; then
+        echo '⚠️ Timeout waiting for Airflow. You may need to trigger the DAG manually.' &&
+        exit 1
+      fi &&
+      echo '⏳ Waiting for DAG to be registered...' &&
+      sleep 15 &&
+      echo '🚀 Triggering etl_pipeline DAG...' &&
+      airflow dags trigger etl_pipeline &&
+      echo '✅ DAG triggered successfully'
+      "
+    depends_on:
+      airflow-webserver:
+        condition: service_started
+      airflow-scheduler:
+        condition: service_started
+    restart: 'no'
+
+volumes:
+  minio_data:
+  postgres_data:

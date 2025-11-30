@@ -1,0 +1,25 @@
+# Requirements for Airflow containers
+# These packages will be installed in Airflow worker/scheduler containers
+
+# Core ETL Dependencies
+pandas
+pyarrow
+duckdb
+boto3
+s3fs
+
+# Kafka
+confluent-kafka
+
+# Fast ML for Category Classification (optimized for speed)
+# Using sentence-transformers instead of full transformers (much faster, smaller)
+sentence-transformers
+scikit-learn
+numpy
+
+# Optional: Full transformers if needed (commented out for speed)
+# transformers
+# torch
+# sentencepiece
+# protobuf
+

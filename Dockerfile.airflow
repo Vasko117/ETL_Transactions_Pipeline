@@ -1,0 +1,31 @@
+# Custom Airflow image with ML/NLP packages pre-installed
+FROM apache/airflow:2.9.2
+
+# Switch to root to install packages
+USER root
+
+# Install system dependencies if needed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Switch back to airflow user
+USER airflow
+
+# Pre-install Python packages (these will be cached in the image)
+# Using fast ML libraries (sentence-transformers is much faster than full transformers)
+RUN pip install --no-cache-dir \
+    pandas \
+    pyarrow \
+    duckdb \
+    boto3 \
+    s3fs \
+    confluent-kafka \
+    sentence-transformers \
+    scikit-learn \
+    numpy
+
+# Set working directory
+WORKDIR /opt/airflow
+
