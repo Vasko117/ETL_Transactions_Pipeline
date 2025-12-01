@@ -1,11 +1,13 @@
 """
-ETL Pipeline DAG
-Automates the complete ETL workflow:
+Real-Time ETL Pipeline DAG
+Demonstrates Kafka's value in a streaming data pipeline:
 1. Create Kafka topic
-2. Produce data to Kafka
-3. Bronze: Consume from Kafka and write to MinIO
+2. Stream transactions to Kafka (real-time simulation)
+3. Bronze: Consume from Kafka incrementally and write to MinIO (true streaming)
 4. Silver: Transform Bronze data
 5. Gold: Transform Silver data into Data Warehouse
+
+Kafka provides: Decoupling, buffering, real-time processing, scalability
 """
 
 from datetime import datetime, timedelta
@@ -121,11 +123,11 @@ default_args = {
 dag = DAG(
     'etl_pipeline',
     default_args=default_args,
-    description='Complete ETL pipeline from Kafka to Gold layer',
+    description='Real-time streaming ETL pipeline demonstrating Kafka value',
     schedule_interval='@once',  # Run once when triggered
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=['etl', 'kafka', 'datawarehouse'],
+    tags=['etl', 'kafka', 'streaming', 'datawarehouse'],
 )
 
 create_kafka_topic = PythonOperator(
@@ -165,7 +167,7 @@ silver_to_gold = BashOperator(
     task_id='silver_to_gold',
     bash_command="""
     cd /opt/airflow/scripts && \
-    python3 silver_to_gold_flink.py
+    python3 silver_to_gold.py
     """,
     dag=dag,
 )

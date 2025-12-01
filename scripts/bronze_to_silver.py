@@ -37,6 +37,18 @@ silver_prefix = "silver"
 
 print("✅ Connected to DuckDB and configured MinIO access")
 
+# Create state table to track processed Bronze files (incremental processing)
+con.execute("""
+    CREATE TABLE IF NOT EXISTS processed_bronze_files (
+        file_path VARCHAR PRIMARY KEY,
+        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+# Get list of already processed files
+processed_files_result = con.execute("SELECT file_path FROM processed_bronze_files").fetchall()
+processed_files_set = {row[0] for row in processed_files_result}
+print(f"📋 Found {len(processed_files_set)} already processed Bronze files")
 
 resp = s3.list_objects_v2(
     Bucket=bucket_name,
@@ -47,55 +59,73 @@ if "Contents" not in resp:
     print("⚠️ No objects found inside Bronze folder!")
     sys.exit(0)
 
-parquet_files = [
+all_parquet_files = [
     f"s3://{bucket_name}/{obj['Key']}"
     for obj in resp["Contents"]
     if obj["Key"].endswith(".parquet")
 ]
 
-if not parquet_files:
+if not all_parquet_files:
     print("⚠️ No Bronze parquet files found!")
     sys.exit(0)
 
-print(f"📦 Found {len(parquet_files)} Bronze parquet files")
+# Filter to only new files (incremental processing)
+parquet_files = [f for f in all_parquet_files if f not in processed_files_set]
 
-print("🚀 Transforming Bronze → Silver...")
+if not parquet_files:
+    print(f"✅ All {len(all_parquet_files)} Bronze files already processed. Nothing new to process.")
+    con.close()
+    sys.exit(0)
+
+print(f"📦 Found {len(all_parquet_files)} total Bronze files, {len(parquet_files)} new files to process")
+
+print("🚀 Transforming Bronze → Silver (incremental processing)...")
 
 
 for file in parquet_files:
+    try:
+        # Generate unique parquet name
+        silver_file = f"s3://{bucket_name}/{silver_prefix}/silver_{uuid.uuid4().hex}.parquet"
 
-    # Generate unique parquet name
-    silver_file = f"s3://{bucket_name}/{silver_prefix}/silver_{uuid.uuid4().hex}.parquet"
+        con.execute(f"""
+            COPY (
+                SELECT 
+                    user_id,
+                    name,
+                    email,
+                    phone,
+                    street_address,
+                    city,
+                    country,
+                    transaction_id,
+                    TRY_CAST(transaction_date AS TIMESTAMP) AS transaction_date,
+                    TRY_CAST(amount AS DOUBLE) AS amount,
+                    currency,
+                    merchant,
+                    description,
+                    transaction_type,
+                    payment_method
+                FROM read_parquet('{file}')
+                WHERE email LIKE '%@%'
+                  AND amount IS NOT NULL
+                  AND TRY_CAST(amount AS DOUBLE) > 0
+                  AND TRY_CAST(transaction_date AS TIMESTAMP) IS NOT NULL
+            )
+            TO '{silver_file}'
+            (FORMAT PARQUET, OVERWRITE_OR_IGNORE TRUE)
+        """)
 
-    con.execute(f"""
-        COPY (
-            SELECT 
-                user_id,
-                name,
-                email,
-                phone,
-                street_address,
-                city,
-                country,
-                transaction_id,
-                TRY_CAST(transaction_date AS TIMESTAMP) AS transaction_date,
-                TRY_CAST(amount AS DOUBLE) AS amount,
-                currency,
-                merchant,
-                description,
-                transaction_type,
-                payment_method
-            FROM read_parquet('{file}')
-            WHERE email LIKE '%@%'
-              AND amount IS NOT NULL
-              AND TRY_CAST(amount AS DOUBLE) > 0
-              AND TRY_CAST(transaction_date AS TIMESTAMP) IS NOT NULL
-        )
-        TO '{silver_file}'
-        (FORMAT PARQUET, OVERWRITE_OR_IGNORE TRUE)
-    """)
+        # Mark this Bronze file as processed ONLY after successful transformation
+        con.execute(f"""
+            INSERT OR IGNORE INTO processed_bronze_files (file_path)
+            VALUES ('{file}')
+        """)
 
-    print(f"✅ Silver file written: {silver_file}")
+        print(f"✅ Silver file written: {silver_file} (Bronze file marked as processed)")
+    except Exception as e:
+        print(f"❌ Error processing Bronze file {file}: {e}")
+        print(f"⚠️ File NOT marked as processed - will retry on next run")
+        continue
 
 # ============================================================
 # 6. Preview sample of silver output
@@ -116,3 +146,4 @@ except Exception as e:
 
 con.close()
 print("🎉 Silver ETL complete, connection closed.")
+
